@@ -1,0 +1,139 @@
+### 1. Общая схема
+
+```
+Statist.ClickHouse ──► Python ETL (tf) ──► Greenplum (schema all_control_snoopy)
+                                      │
+                                      ├─► Forensic GP → usr_forensic.control_table
+                                      │
+                                      └─► Excel “Историчность контролей.xlsx” (+ Time dispatch)
+```
+
+---
+
+## 2. Извлечение данных (Python + SQL)
+
+### 2.1 
+
+| Блок                   | Описание                                                                                                                                                                                                         |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **SQL-чтение**         | Скрипт выбирает события `snoopy.controlSuccess` из `statist.events_distributed`. <br>Фильтр: `namespace='complianceEthic'`, `project='complianceEthic.snoopy.web.events'`, дата ≥ 2025-04-14.                    |
+| **Нормализация полей** | *`parameters_string_0`*  → `control_date`<br>*`parameters_string_1`*  → `login` (12 масок, маппинг через `CASE`)<br>*`parameters_string_2`*  → `control_type` (30 значений)<br>*`parameters_string_3`*  → `task` |
+| **tf.click\_to\_df**   | Превращает результат ClickHouse-запроса в `pandas.DataFrame`.                                                                                                                  |
+| **tf.df\_to\_gp**      | Грузит датафрейм в GP таблицу `all_control_snoopy` (schema по умолчанию).                                                                                                                                        |
+
+> **Важно:** если добавляется новый `control_type`, нужно лишь править секцию `CASE parameters_string_2`.
+
+---
+
+### 2.2 Основные зависимости
+
+```bash
+pandas
+tframework>=2.3          # tf.click_to_df, tf.df_to_gp
+sqlalchemy[greenplum]
+clickhouse-driver
+```
+
+---
+
+## 3. Загрузка в боевые таблицы (SQL)
+
+### 3.1 Просмотр сырья
+
+```sql
+SELECT * FROM all_control_snoopy;
+```
+
+### 3.2 Инкрементальная вставка
+
+```sql
+INSERT INTO usr_forensic.control_table (
+        eventTimestamp
+      , task, control_type, control_date
+      , login, comment, status)
+SELECT s.eventTimestamp::timestamp
+     , s.task, s.control_type, s.control_date::date
+     , s.login, NULL, 'STATIST'
+FROM   all_control_snoopy s
+WHERE  NOT EXISTS (
+        SELECT 1
+        FROM   usr_forensic.control_table t
+        WHERE  t.eventTimestamp = s.eventTimestamp::timestamp);
+```
+
+*Ключ дупликации* — `eventTimestamp`.
+`status='STATIST'` метит авто-запись.
+
+### 3.3 Срез «контроль на сегодня»
+
+```sql
+CREATE TABLE login_today_control AS
+SELECT eventTimestamp, login, task, control_type
+FROM   all_control_snoopy
+WHERE  control_date::date = NOW()::date;
+```
+
+> Таблица пересоздаётся (`DROP + CREATE`) при каждом запуске.
+
+---
+
+## 4. Dispatch-бот (Python)
+
+### 4.1 `dispatch_control.py`
+
+| Шаг | Детали                                                                                                       |
+| --- | ------------------------------------------------------------------------------------------------------------ |
+| 1   | Берём `today_control` (+ обогащение MDM → подразделение).                                                    |
+| 2   | Для каждого логина собираем `task`, `control_type`.                                                          |
+| 3   | Формируем Markdown-сообщение:<br>• если `task` содержит `FIP` → ссылка на Jira.<br>• иначе ссылка на Snoopy. |
+| 4   | Отправка через `send_to_users_prod_and_ops()` (под Prod и Ops токенами).                                     |
+| 5   | Логируем отправки в `attempts_to_sql()`.                                                                     |
+
+> **Расширение:** текст сообщения хранить в шаблоне Jinja2, тогда бизнес-текст можно менять без кода.
+
+---
+
+## 5. Экспорт «Историчность контролей»
+
+### 5.1 Логика
+
+| Этап                      | Код                                                          |
+| ------------------------- | ------------------------------------------------------------ |
+| Выборка вчерашних записей | Фильтр по МСК-дате через `pytz`                              |
+| Загрузка Excel            | `tcloud.download()` — скачиваем из Nextcloud                 |
+| Объединение               | `pd.concat` → `drop_duplicates` по «Дата установки контроля» |
+| Аплоад                    | `combined_controls.to_excel()` → `tcloud.upload()`           |
+
+### 5.2 Формат Excel
+
+| Колонка                 | Источник                             |
+| ----------------------- | ------------------------------------ |
+| Дата установки контроля | `eventTimestamp` (UTC → МСК, без TZ) |
+| Номер задачи            | `task`                               |
+| Тип контроля            | `control_type`                       |
+| Дата напоминания        | `control_date`                       |
+| Логин                   | `login`                              |
+| Комментарий             | пустой (заполняется вручную)         |
+
+---
+
+---
+
+## 6. Расширение / поддержка
+
+1. **Новый тип контроля** – добавить `WHEN parameters_string_2 = '31' THEN '...'` в SQL.
+2. **Новый клиент** – расширить `client`-маппинг.
+3. **Дедупликация по другому ключу** – изменить условие `NOT EXISTS` в секции вставки.
+4. **Отправка в Slack** – заменить/дополнить `send_to_users_prod_and_ops()` Slack-вебхуком.
+5. **Ошибки подключения `tcloud`** – скрипт падает; обернуть в `try/except`, отправлять алерт в Teams «ETL-Alerts».
+
+---
+
+## 7. Контрольные точки
+
+| Проверка          | Команда/запрос                                                  |
+| ----------------- | --------------------------------------------------------------- |
+| GP загрузилось    | `SELECT COUNT(*) FROM all_control_snoopy WHERE date=CURDATE();` |
+| Forensic актуален | `SELECT MAX(eventTimestamp) FROM usr_forensic.control_table;`   |
+| Excel обновился   | Версия файла на Nextcloud + дата в кол-ке                       |
+| Teams-уведомления | По логу `attempts_to_sql` (status=OK)                           |
